@@ -1,7 +1,6 @@
 {
   "org": "your-org",
   "output": "D:\\path\\to\\your\\obsidian\\vault\\PPMP",
-  "token": "",
-  "issues_limit": 500,
-  "base_url": "https://sonarcloud.io"
+  "github_token": "",
+  "issues_limit": 500
 }

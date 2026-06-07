@@ -18,11 +18,12 @@ import (
 // ── CLI flags ──────────────────────────────────────────────
 
 var (
-	orgKey     string
-	token      string
-	outputDir  string
-	baseURL    string
-	issueLimit int
+	orgKey      string
+	token       string
+	outputDir   string
+	baseURL     string
+	issueLimit  int
+	githubToken string
 )
 
 func init() {
@@ -31,16 +32,18 @@ func init() {
 	flag.StringVar(&outputDir, "o", "", "Output directory (e.g. D:\\workspace\\MyMind\\PPMP)")
 	flag.StringVar(&baseURL, "base-url", "https://sonarcloud.io", "SonarCloud base URL")
 	flag.IntVar(&issueLimit, "issues-limit", 500, "Max issues per project")
+	flag.StringVar(&githubToken, "github-token", "", "GitHub token for repo metadata checks")
 }
 
 // ── Config file ────────────────────────────────────────────
 
 type Config struct {
-	Org        string `json:"org"`
-	Output     string `json:"output"`
-	Token      string `json:"token,omitempty"`
-	BaseURL    string `json:"base_url,omitempty"`
-	IssueLimit int    `json:"issues_limit,omitempty"`
+	Org         string `json:"org"`
+	Output      string `json:"output"`
+	Token       string `json:"token,omitempty"`
+	GitHubToken string `json:"github_token,omitempty"`
+	BaseURL     string `json:"base_url,omitempty"`
+	IssueLimit  int    `json:"issues_limit,omitempty"`
 }
 
 func loadConfig() Config {
@@ -58,7 +61,13 @@ func loadConfig() Config {
 		if err != nil {
 			continue
 		}
-		json.Unmarshal(data, &cfg)
+		// Strip UTF-8 BOM if present
+		if len(data) >= 3 && data[0] == 0xEF && data[1] == 0xBB && data[2] == 0xBF {
+			data = data[3:]
+		}
+		if err := json.Unmarshal(data, &cfg); err != nil {
+			continue
+		}
 		break
 	}
 	return cfg
@@ -81,6 +90,9 @@ func resolveConfig() {
 	}
 	if issueLimit == 500 && cfg.IssueLimit > 0 {
 		issueLimit = cfg.IssueLimit
+	}
+	if githubToken == "" {
+		githubToken = cfg.GitHubToken
 	}
 }
 
@@ -405,7 +417,7 @@ func scoreIcon(score int) string {
 
 // ── Analysis ───────────────────────────────────────────────
 
-func analyze(reports []ProjectReport) {
+func analyze(reports []ProjectReport, projects []ProjectItem) {
 	fmt.Fprintf(os.Stderr, "\nAnalyzing %d projects...\n", len(reports))
 
 	ruleMap := map[string]*RuleStat{}
@@ -515,6 +527,12 @@ func analyze(reports []ProjectReport) {
 		NotAnalyzed: notAnalyzed,
 	}
 	appendTrend(entry)
+
+	// ── Period report ──
+	generatePeriodReport(latestDir)
+
+	// ── GitHub repo checks ──
+	generateRepoChecks(latestDir, projects)
 
 	fmt.Fprintf(os.Stderr, "\nDone. Output: %s\n", outputDir)
 	fmt.Fprintf(os.Stderr, "  latest/        <- Agent reads this\n")
@@ -1203,6 +1221,263 @@ func writeFile(path, content string) {
 	fmt.Fprintf(os.Stderr, "  -> %s\n", path)
 }
 
+// ── GitHub repo metadata checks ───────────────────────────
+
+type RepoCheck struct {
+	Repo     string
+	HasReadme    bool
+	HasLicense   bool
+	HasGitignore bool
+	HasCI        bool
+	HasLockFile  bool
+	HasDocker    bool
+	HasContrib   bool
+	Score        int  // 0-100
+	Issues       []string
+}
+
+func checkGitHubRepo(owner, repo string) (*RepoCheck, error) {
+	if githubToken == "" {
+		return nil, nil
+	}
+
+	rc := &RepoCheck{Repo: owner + "/" + repo}
+
+	// Check repo contents via GitHub API
+	checkFile := func(path string) bool {
+		u := fmt.Sprintf("https://api.github.com/repos/%s/%s/contents/%s", owner, repo, path)
+		req, _ := http.NewRequest("GET", u, nil)
+		req.Header.Set("Authorization", "Bearer "+githubToken)
+		req.Header.Set("Accept", "application/vnd.github.v3+json")
+		client := &http.Client{Timeout: 10 * time.Second}
+		resp, err := client.Do(req)
+		if err != nil {
+			return false
+		}
+		defer resp.Body.Close()
+		return resp.StatusCode == 200
+	}
+
+	checkDir := func(path string) bool {
+		u := fmt.Sprintf("https://api.github.com/repos/%s/%s/contents/%s", owner, repo, path)
+		req, _ := http.NewRequest("GET", u, nil)
+		req.Header.Set("Authorization", "Bearer "+githubToken)
+		req.Header.Set("Accept", "application/vnd.github.v3+json")
+		client := &http.Client{Timeout: 10 * time.Second}
+		resp, err := client.Do(req)
+		if err != nil {
+			return false
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode != 200 {
+			return false
+		}
+		var items []map[string]interface{}
+		json.NewDecoder(resp.Body).Decode(&items)
+		return len(items) > 0
+	}
+
+	rc.HasReadme = checkFile("README.md") || checkFile("readme.md") || checkFile("README.MD")
+	rc.HasLicense = checkFile("LICENSE") || checkFile("LICENSE.md") || checkFile("LICENCE")
+	rc.HasGitignore = checkFile(".gitignore")
+	rc.HasCI = checkDir(".github/workflows") || checkFile(".gitlab-ci.yml") || checkFile("Jenkinsfile") || checkFile(".travis.yml")
+	rc.HasLockFile = checkFile("go.sum") || checkFile("package-lock.json") || checkFile("yarn.lock") || checkFile("pnpm-lock.yaml") || checkFile("Cargo.lock") || checkFile("pom.xml")
+	rc.HasDocker = checkFile("Dockerfile") || checkFile("docker-compose.yml") || checkFile("docker-compose.yaml")
+	rc.HasContrib = checkFile("CONTRIBUTING.md") || checkFile("CONTRIBUTING")
+
+	// Score: each item = 14 points (7 items * 14 = 98, +2 base)
+	score := 2
+	checks := []struct {
+		ok   bool
+		name string
+	}{
+		{rc.HasReadme, "README.md"},
+		{rc.HasLicense, "LICENSE"},
+		{rc.HasGitignore, ".gitignore"},
+		{rc.HasCI, "CI config"},
+		{rc.HasLockFile, "Dependency lock file"},
+		{rc.HasDocker, "Dockerfile"},
+		{rc.HasContrib, "CONTRIBUTING.md"},
+	}
+	for _, c := range checks {
+		if c.ok {
+			score += 14
+		} else {
+			rc.Issues = append(rc.Issues, "Missing: "+c.name)
+		}
+	}
+	rc.Score = score
+	return rc, nil
+}
+
+func generateRepoChecks(dir string, projects []ProjectItem) {
+	if githubToken == "" {
+		return
+	}
+
+	fmt.Fprintf(os.Stderr, "\nChecking GitHub repo metadata...\n")
+
+	var checks []*RepoCheck
+	for _, p := range projects {
+		// Extract owner/repo from project key (e.g. Tangyd893_SnapShop -> Tangyd893, SnapShop)
+		idx := strings.Index(p.Key, "_")
+		if idx <= 0 {
+			continue
+		}
+		owner := p.Key[:idx]
+		repo := p.Key[idx+1:]
+
+		rc, err := checkGitHubRepo(owner, repo)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "  %s: %v\n", p.Key, err)
+			continue
+		}
+		if rc != nil {
+			checks = append(checks, rc)
+			fmt.Fprintf(os.Stderr, "  %s: %d/100\n", p.Key, rc.Score)
+		}
+	}
+
+	if len(checks) == 0 {
+		return
+	}
+
+	// Sort by score ascending (worst first)
+	sort.Slice(checks, func(i, j int) bool {
+		return checks[i].Score < checks[j].Score
+	})
+
+	var b strings.Builder
+	b.WriteString("# GitHub 仓库工程规范检查\n\n")
+	b.WriteString(fmt.Sprintf("- **检查项目数**: %d\n", len(checks)))
+	b.WriteString(fmt.Sprintf("- **更新时间**: %s\n\n", time.Now().Format("2006-01-02 15:04")))
+
+	b.WriteString("## 评分排名\n\n")
+	b.WriteString("| 仓库 | 分数 | README | License | .gitignore | CI | Lock | Docker | Contrib |\n")
+	b.WriteString("|------|------|--------|---------|------------|-----|------|--------|--------|\n")
+	boolIcon := func(v bool) string {
+		if v { return "✅" }
+		return "❌"
+	}
+	for _, rc := range checks {
+		b.WriteString(fmt.Sprintf("| %s | %d | %s | %s | %s | %s | %s | %s | %s |\n",
+			rc.Repo, rc.Score,
+			boolIcon(rc.HasReadme), boolIcon(rc.HasLicense), boolIcon(rc.HasGitignore),
+			boolIcon(rc.HasCI), boolIcon(rc.HasLockFile), boolIcon(rc.HasDocker), boolIcon(rc.HasContrib)))
+	}
+	b.WriteString("\n")
+
+	// Detail for repos with issues
+	var problemRepos []*RepoCheck
+	for _, rc := range checks {
+		if len(rc.Issues) > 0 {
+			problemRepos = append(problemRepos, rc)
+		}
+	}
+	if len(problemRepos) > 0 {
+		b.WriteString("## 待改进\n\n")
+		for _, rc := range problemRepos {
+			b.WriteString(fmt.Sprintf("### %s (%d/100)\n\n", rc.Repo, rc.Score))
+			for _, iss := range rc.Issues {
+				b.WriteString(fmt.Sprintf("- %s\n", iss))
+			}
+			b.WriteString("\n")
+		}
+	}
+
+	b.WriteString("---\n\nRelated:\n- [[项目质量总览]]\n- [[质量待办]]\n")
+	writeFile(filepath.Join(dir, "GitHub工程规范.md"), b.String())
+}
+
+// ── Weekly / Monthly report ────────────────────────────────
+
+func generatePeriodReport(dir string) {
+	trendFile := filepath.Join(outputDir, "质量趋势.md")
+	data, err := os.ReadFile(trendFile)
+	if err != nil {
+		return
+	}
+
+	var entries []TrendEntry
+	lines := strings.Split(string(data), "\n")
+	for _, line := range lines {
+		if !strings.HasPrefix(line, "|") || strings.HasPrefix(line, "| 日期") || strings.HasPrefix(line, "|---") {
+			continue
+		}
+		parts := strings.Split(line, "|")
+		if len(parts) < 9 {
+			continue
+		}
+		te := TrendEntry{Date: strings.TrimSpace(parts[1])}
+		fmt.Sscanf(strings.TrimSpace(parts[2]), "%d", &te.TotalIssues)
+		fmt.Sscanf(strings.TrimSpace(parts[3]), "%d", &te.Blockers)
+		fmt.Sscanf(strings.TrimSpace(parts[4]), "%d", &te.Criticals)
+		fmt.Sscanf(strings.TrimSpace(parts[5]), "%d", &te.Majors)
+		fmt.Sscanf(strings.TrimSpace(parts[6]), "%d", &te.QGPassed)
+		fmt.Sscanf(strings.TrimSpace(parts[7]), "%d", &te.QGFailed)
+		fmt.Sscanf(strings.TrimSpace(parts[8]), "%d", &te.NotAnalyzed)
+		entries = append(entries, te)
+	}
+
+	if len(entries) < 2 {
+		return
+	}
+
+	now := time.Now()
+	var thisWeek, lastWeek, thisMonth, lastMonth *TrendEntry
+
+	for i := len(entries) - 1; i >= 0; i-- {
+		t, err := time.Parse("2006-01-02", entries[i].Date)
+		if err != nil {
+			continue
+		}
+		daysDiff := int(now.Sub(t).Hours() / 24)
+
+		if thisWeek == nil && daysDiff <= 7 {
+			thisWeek = &entries[i]
+		}
+		if lastWeek == nil && daysDiff > 7 && daysDiff <= 14 {
+			lastWeek = &entries[i]
+		}
+		if thisMonth == nil && daysDiff <= 30 {
+			thisMonth = &entries[i]
+		}
+		if lastMonth == nil && daysDiff > 30 && daysDiff <= 60 {
+			lastMonth = &entries[i]
+		}
+	}
+
+	var b strings.Builder
+	b.WriteString("# 周期报告\n\n")
+	b.WriteString(fmt.Sprintf("- **生成时间**: %s\n\n", now.Format("2006-01-02 15:04")))
+
+	writeDelta := func(label string, curr, prev *TrendEntry) {
+		if curr == nil {
+			b.WriteString(fmt.Sprintf("### %s\n\n_无数据_\n\n", label))
+			return
+		}
+		b.WriteString(fmt.Sprintf("### %s (%s)\n\n", label, curr.Date))
+		b.WriteString(fmt.Sprintf("- 总 Issue: %d", curr.TotalIssues))
+		if prev != nil {
+			delta := curr.TotalIssues - prev.TotalIssues
+			icon := "➡️"
+			if delta > 0 { icon = "📈" } else if delta < 0 { icon = "📉" }
+			b.WriteString(fmt.Sprintf(" %s %d (vs %s)", icon, delta, prev.Date))
+		}
+		b.WriteString("\n")
+		b.WriteString(fmt.Sprintf("- Blocker: %d, Critical: %d, Major: %d\n", curr.Blockers, curr.Criticals, curr.Majors))
+		b.WriteString(fmt.Sprintf("- QG 通过: %d, 失败: %d, 未分析: %d\n\n", curr.QGPassed, curr.QGFailed, curr.NotAnalyzed))
+	}
+
+	b.WriteString("## 本周\n\n")
+	writeDelta("本周", thisWeek, lastWeek)
+	b.WriteString("## 本月\n\n")
+	writeDelta("本月", thisMonth, lastMonth)
+
+	b.WriteString("---\n\nRelated:\n- [[质量趋势]]\n- [[项目质量总览]]\n")
+	writeFile(filepath.Join(dir, "周期报告.md"), b.String())
+}
+
 // ── Main ───────────────────────────────────────────────────
 
 func main() {
@@ -1249,5 +1524,5 @@ func main() {
 		os.Exit(1)
 	}
 
-	analyze(reports)
+	analyze(reports, projects)
 }
