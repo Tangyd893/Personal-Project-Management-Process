@@ -1,0 +1,83 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        goos: [linux, windows, darwin]
+        goarch: [amd64, arm64]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.21'
+
+      - name: Build sonar-report
+        working-directory: sonarcloud-report-skill/Script
+        run: |
+          EXTENSION=""
+          if [ "${{ matrix.goos }}" = "windows" ]; then
+            EXTENSION=".exe"
+          fi
+          GOOS=${{ matrix.goos }} GOARCH=${{ matrix.goarch }} go build -ldflags="-s -w" -o sonar-report-${{ matrix.goos }}-${{ matrix.goarch }}${EXTENSION} main.go
+
+      - name: Build sonar-analyze
+        working-directory: sonarcloud-report-skill/Script
+        run: |
+          EXTENSION=""
+          if [ "${{ matrix.goos }}" = "windows" ]; then
+            EXTENSION=".exe"
+          fi
+          GOOS=${{ matrix.goos }} GOARCH=${{ matrix.goarch }} go build -ldflags="-s -w" -o sonar-analyze-${{ matrix.goos }}-${{ matrix.goarch }}${EXTENSION} analyze.go
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ppmp-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: |
+            sonarcloud-report-skill/Script/sonar-report-*
+            sonarcloud-report-skill/Script/sonar-analyze-*
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Package
+        run: |
+          mkdir -p release
+          for dir in artifacts/ppmp-*; do
+            platform=$(basename $dir | sed 's/ppmp-//')
+            tar -czf release/ppmp-${platform}.tar.gz -C $dir .
+          done
+
+      - name: Generate checksums
+        run: |
+          cd release
+          sha256sum *.tar.gz > checksums.txt
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            release/*.tar.gz
+            release/checksums.txt
+          generate_release_notes: true
+          draft: false
+          prerelease: false
