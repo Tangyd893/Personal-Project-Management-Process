@@ -4,6 +4,9 @@
 *.so
 *.dylib
 
+# Config (may contain tokens)
+ppmp.json
+
 # OS files
 .DS_Store
 Thumbs.db
