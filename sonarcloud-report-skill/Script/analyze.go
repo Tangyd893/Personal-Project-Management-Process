@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -30,6 +31,57 @@ func init() {
 	flag.StringVar(&outputDir, "o", "", "Output directory (e.g. D:\\workspace\\MyMind\\PPMP)")
 	flag.StringVar(&baseURL, "base-url", "https://sonarcloud.io", "SonarCloud base URL")
 	flag.IntVar(&issueLimit, "issues-limit", 500, "Max issues per project")
+}
+
+// ── Config file ────────────────────────────────────────────
+
+type Config struct {
+	Org        string `json:"org"`
+	Output     string `json:"output"`
+	Token      string `json:"token,omitempty"`
+	BaseURL    string `json:"base_url,omitempty"`
+	IssueLimit int    `json:"issues_limit,omitempty"`
+}
+
+func loadConfig() Config {
+	cfg := Config{}
+	// Search order: ./ppmp.json, $OUTPUT_DIR/ppmp.json, $HOME/.ppmp.json
+	candidates := []string{"ppmp.json"}
+	if outputDir != "" {
+		candidates = append(candidates, filepath.Join(outputDir, "ppmp.json"))
+	}
+	if home, err := os.UserHomeDir(); err == nil {
+		candidates = append(candidates, filepath.Join(home, ".ppmp.json"))
+	}
+	for _, path := range candidates {
+		data, err := os.ReadFile(path)
+		if err != nil {
+			continue
+		}
+		json.Unmarshal(data, &cfg)
+		break
+	}
+	return cfg
+}
+
+func resolveConfig() {
+	cfg := loadConfig()
+	// CLI flags override config
+	if orgKey == "" {
+		orgKey = cfg.Org
+	}
+	if outputDir == "" {
+		outputDir = cfg.Output
+	}
+	if token == "" {
+		token = cfg.Token
+	}
+	if baseURL == "https://sonarcloud.io" && cfg.BaseURL != "" {
+		baseURL = cfg.BaseURL
+	}
+	if issueLimit == 500 && cfg.IssueLimit > 0 {
+		issueLimit = cfg.IssueLimit
+	}
 }
 
 // ── Types ──────────────────────────────────────────────────
@@ -312,11 +364,9 @@ func classifyByPattern(issues []IssueItem) map[string][]IssueItem {
 	return groups
 }
 
-// Health score: 100 - weighted deductions
-// BLOCKER -10, CRITICAL -5, MAJOR -2, MINOR -1, max 0
 func calcHealthScore(issues []IssueItem, analyzed bool) int {
 	if !analyzed {
-		return -1 // sentinel: not analyzed
+		return -1
 	}
 	score := 100
 	for _, iss := range issues {
@@ -436,6 +486,9 @@ func analyze(reports []ProjectReport) {
 	projDir := filepath.Join(latestDir, "projects")
 	os.MkdirAll(projDir, 0755)
 
+	// ── Diff before overwriting latest/ ──
+	generateDiff(latestDir, reports)
+
 	generateOverview(latestDir, summaries, totalIssues, severityTotals, typeTotals)
 	generateRuleStats(latestDir, rules, len(reports), totalIssues)
 	generateHighFreqIssues(latestDir, rules, len(reports))
@@ -466,7 +519,7 @@ func analyze(reports []ProjectReport) {
 	fmt.Fprintf(os.Stderr, "\nDone. Output: %s\n", outputDir)
 	fmt.Fprintf(os.Stderr, "  latest/        <- Agent reads this\n")
 	fmt.Fprintf(os.Stderr, "  snapshots/%s/ <- archived\n", time.Now().Format("2006-01-02"))
-	fmt.Fprintf(os.Stderr, "  质量趋势.md     <- trend data\n")
+	fmt.Fprintf(os.Stderr, "  quality-trend.md <- trend data\n")
 }
 
 // ── Copy helper ────────────────────────────────────────────
@@ -492,16 +545,120 @@ func copyDir(src, dst string) {
 	}
 }
 
+// ── Incremental diff ───────────────────────────────────────
+
+func generateDiff(latestDir string, currentReports []ProjectReport) {
+	// Build current issue set (key -> project)
+	currentIssues := map[string]string{}
+	for _, r := range currentReports {
+		for _, iss := range r.Issues {
+			currentIssues[iss.Key] = r.Project.Key
+		}
+	}
+
+	// Load previous issues from latest/projects/*.md
+	// We can't perfectly reconstruct issue keys from markdown,
+	// so we use a snapshot JSON approach instead.
+	snapshotFile := filepath.Join(outputDir, ".snapshot-issues.json")
+	var prevIssues map[string]string // issue key -> project key
+	data, err := os.ReadFile(snapshotFile)
+	if err == nil {
+		json.Unmarshal(data, &prevIssues)
+	}
+
+	// Save current snapshot for next run
+	snapshotData, _ := json.MarshalIndent(currentIssues, "", "  ")
+	os.WriteFile(snapshotFile, snapshotData, 0644)
+
+	if prevIssues == nil {
+		// First run, no diff
+		return
+	}
+
+	// Compute diff
+	var newIssues []struct {
+		Key      string
+		Project  string
+	}
+	var resolvedIssues []struct {
+		Key      string
+		Project  string
+	}
+
+	for key, proj := range currentIssues {
+		if _, exists := prevIssues[key]; !exists {
+			newIssues = append(newIssues, struct {
+				Key     string
+				Project string
+			}{key, proj})
+		}
+	}
+	for key, proj := range prevIssues {
+		if _, exists := currentIssues[key]; !exists {
+			resolvedIssues = append(resolvedIssues, struct {
+				Key     string
+				Project string
+			}{key, proj})
+		}
+	}
+
+	// Write diff report
+	var b strings.Builder
+	b.WriteString("# 增量变化\n\n")
+	b.WriteString(fmt.Sprintf("- **对比日期**: %s vs 上次运行\n", time.Now().Format("2006-01-02 15:04")))
+	b.WriteString(fmt.Sprintf("- **新增 Issue**: %d\n", len(newIssues)))
+	b.WriteString(fmt.Sprintf("- **已解决 Issue**: %d\n\n", len(resolvedIssues)))
+
+	if len(newIssues) == 0 && len(resolvedIssues) == 0 {
+		b.WriteString("_无变化_\n\n")
+	} else {
+		// Net change
+		net := len(newIssues) - len(resolvedIssues)
+		icon := "➡️"
+		if net > 0 {
+			icon = "📈"
+		} else if net < 0 {
+			icon = "📉"
+		}
+		b.WriteString(fmt.Sprintf("**净变化**: %s %d\n\n", icon, net))
+
+		if len(resolvedIssues) > 0 {
+			b.WriteString(fmt.Sprintf("## 🟢 已解决 (%d)\n\n", len(resolvedIssues)))
+			byProj := map[string][]string{}
+			for _, ri := range resolvedIssues {
+				byProj[ri.Project] = append(byProj[ri.Project], ri.Key)
+			}
+			for proj, keys := range byProj {
+				b.WriteString(fmt.Sprintf("**%s**: %d 个\n", proj, len(keys)))
+			}
+			b.WriteString("\n")
+		}
+
+		if len(newIssues) > 0 {
+			b.WriteString(fmt.Sprintf("## 🔴 新增 (%d)\n\n", len(newIssues)))
+			byProj := map[string][]string{}
+			for _, ni := range newIssues {
+				byProj[ni.Project] = append(byProj[ni.Project], ni.Key)
+			}
+			for proj, keys := range byProj {
+				b.WriteString(fmt.Sprintf("**%s**: %d 个\n", proj, len(keys)))
+			}
+			b.WriteString("\n")
+		}
+	}
+
+	b.WriteString("---\n\nRelated:\n- [[项目质量总览]]\n- [[质量趋势]]\n")
+	writeFile(filepath.Join(latestDir, "增量变化.md"), b.String())
+}
+
 // ── Trend ──────────────────────────────────────────────────
 
 func appendTrend(entry TrendEntry) {
 	trendFile := filepath.Join(outputDir, "质量趋势.md")
 
-	// Read existing entries
 	var entries []TrendEntry
 	data, err := os.ReadFile(trendFile)
 	if err == nil {
-		// Parse existing markdown table rows
 		lines := strings.Split(string(data), "\n")
 		for _, line := range lines {
 			if !strings.HasPrefix(line, "|") || strings.HasPrefix(line, "| 日期") || strings.HasPrefix(line, "|---") {
@@ -525,7 +682,6 @@ func appendTrend(entry TrendEntry) {
 		}
 	}
 
-	// Check if today already exists
 	today := entry.Date
 	found := false
 	for i, e := range entries {
@@ -539,12 +695,10 @@ func appendTrend(entry TrendEntry) {
 		entries = append(entries, entry)
 	}
 
-	// Keep last 90 days
 	if len(entries) > 90 {
 		entries = entries[len(entries)-90:]
 	}
 
-	// Write
 	var b strings.Builder
 	b.WriteString("# 质量趋势\n\n")
 	b.WriteString("> 每次运行 `sonar-analyze` 自动追加数据。保留最近 90 条记录。\n\n")
@@ -816,17 +970,40 @@ func generateHighFreqIssues(dir string, rules []*RuleStat, projectCount int) {
 	writeFile(filepath.Join(dir, "高频问题清单.md"), b.String())
 }
 
-// ── Todo list ──────────────────────────────────────────────
+// ── Todo list (with state persistence) ─────────────────────
 
 func generateTodo(dir string, reports []ProjectReport) {
+	todoFile := filepath.Join(dir, "质量待办.md")
+
+	// Load existing checked items to preserve state
+	checkedItems := map[string]bool{}
+	data, err := os.ReadFile(todoFile)
+	if err == nil {
+		scanner := bufio.NewScanner(strings.NewReader(string(data)))
+		for scanner.Scan() {
+			line := scanner.Text()
+			// Match "- [x]" pattern
+			if strings.Contains(line, "- [x] ") || strings.Contains(line, "- [X] ") {
+				// Extract the unique part (file + rule + message)
+				trimmed := strings.TrimSpace(line)
+				// Remove the checkbox prefix
+				idx := strings.Index(trimmed, "] ")
+				if idx >= 0 {
+					key := trimmed[idx+2:]
+					checkedItems[key] = true
+				}
+			}
+		}
+	}
+
 	var b strings.Builder
 	b.WriteString("# 质量待办\n\n")
-	b.WriteString("> Auto-generated from BLOCKER/CRITICAL issues. Check off when fixed, re-run analyze to refresh.\n\n")
+	b.WriteString("> Auto-generated from BLOCKER/CRITICAL issues. Check off when fixed, re-run analyze to refresh.\n")
+	b.WriteString("> Checked items are preserved across runs.\n\n")
 	b.WriteString(fmt.Sprintf("- **Updated**: %s\n\n", time.Now().Format("2006-01-02 15:04")))
 
-	// Collect all blocker/critical issues grouped by project
-	var todos []TodoItem
 	var noAnalysis []string
+	var todos []TodoItem
 
 	for _, r := range reports {
 		if r.Project.LastAnalysisDate == "" {
@@ -848,17 +1025,14 @@ func generateTodo(dir string, reports []ProjectReport) {
 		}
 	}
 
-	// Not analyzed projects
 	if len(noAnalysis) > 0 {
 		b.WriteString("## ⚠️ 未分析项目\n\n")
-		b.WriteString("以下项目从未运行过 SonarCloud 分析：\n\n")
 		for _, p := range noAnalysis {
 			b.WriteString(fmt.Sprintf("- [ ] 运行分析: `%s`\n", p))
 		}
 		b.WriteString("\n")
 	}
 
-	// Blockers
 	blockers := filterTodos(todos, "BLOCKER")
 	if len(blockers) > 0 {
 		b.WriteString(fmt.Sprintf("## 🔴 BLOCKER (%d)\n\n", len(blockers)))
@@ -870,13 +1044,18 @@ func generateTodo(dir string, reports []ProjectReport) {
 				if item.Line == 0 {
 					line = "-"
 				}
-				b.WriteString(fmt.Sprintf("- [ ] `%s` %s %s: %s\n", item.File, line, item.Rule, item.Message))
+				// Build the item text for checking persistence
+				itemText := fmt.Sprintf("`%s` %s %s: %s", item.File, line, item.Rule, item.Message)
+				checkbox := "- [ ] "
+				if checkedItems[itemText] {
+					checkbox = "- [x] "
+				}
+				b.WriteString(fmt.Sprintf("%s%s\n", checkbox, itemText))
 			}
 			b.WriteString("\n")
 		}
 	}
 
-	// Criticals
 	criticals := filterTodos(todos, "CRITICAL")
 	if len(criticals) > 0 {
 		b.WriteString(fmt.Sprintf("## 🟠 CRITICAL (%d)\n\n", len(criticals)))
@@ -888,7 +1067,12 @@ func generateTodo(dir string, reports []ProjectReport) {
 				if item.Line == 0 {
 					line = "-"
 				}
-				b.WriteString(fmt.Sprintf("- [ ] `%s` %s %s: %s\n", item.File, line, item.Rule, item.Message))
+				itemText := fmt.Sprintf("`%s` %s %s: %s", item.File, line, item.Rule, item.Message)
+				checkbox := "- [ ] "
+				if checkedItems[itemText] {
+					checkbox = "- [x] "
+				}
+				b.WriteString(fmt.Sprintf("%s%s\n", checkbox, itemText))
 			}
 			b.WriteString("\n")
 		}
@@ -898,9 +1082,9 @@ func generateTodo(dir string, reports []ProjectReport) {
 		b.WriteString("_All clear! No BLOCKER or CRITICAL issues._\n\n")
 	}
 
-	b.WriteString("---\n\nRelated:\n- [[项目质量总览]]\n- [[高频问题清单]]\n- [[质量趋势]]\n")
+	b.WriteString("---\n\nRelated:\n- [[项目质量总览]]\n- [[高频问题清单]]\n- [[质量趋势]]\n- [[增量变化]]\n")
 
-	writeFile(filepath.Join(dir, "质量待办.md"), b.String())
+	writeFile(todoFile, b.String())
 }
 
 func filterTodos(todos []TodoItem, severity string) []TodoItem {
@@ -930,14 +1114,12 @@ func generateProjectDetail(dir string, r ProjectReport) {
 	b.WriteString(fmt.Sprintf("- **Open Issues**: %d\n", r.TotalOpen))
 	b.WriteString(fmt.Sprintf("- **Updated**: %s\n\n", time.Now().Format("2006-01-02 15:04")))
 
-	// Analysis status
 	if r.Project.LastAnalysisDate == "" {
 		b.WriteString("> ⚠️ **This project has never been analyzed on SonarCloud.**\n\n")
 	} else {
 		b.WriteString(fmt.Sprintf("- **Last Analysis**: %s\n\n", r.Project.LastAnalysisDate))
 	}
 
-	// Health score
 	analyzed := r.Project.LastAnalysisDate != ""
 	score := calcHealthScore(r.Issues, analyzed)
 	if analyzed {
@@ -1026,13 +1208,16 @@ func writeFile(path, content string) {
 func main() {
 	flag.Parse()
 
+	// Load config file, CLI flags override
+	resolveConfig()
+
 	if orgKey == "" {
-		fmt.Fprintln(os.Stderr, "Error: -org is required")
+		fmt.Fprintln(os.Stderr, "Error: -org is required (or set in ppmp.json)")
 		flag.Usage()
 		os.Exit(1)
 	}
 	if outputDir == "" {
-		fmt.Fprintln(os.Stderr, "Error: -o is required")
+		fmt.Fprintln(os.Stderr, "Error: -o is required (or set in ppmp.json)")
 		flag.Usage()
 		os.Exit(1)
 	}

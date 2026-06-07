@@ -23,6 +23,7 @@ sonar-analyze (批量分析 + 统计)
       │    ├── 高频问题清单.md    ← 跨项目共性问题 + Agent Checklist
       │    ├── 质量待办.md        ← BLOCKER/CRITICAL 待修复清单
       │    ├── 质量趋势.md        ← 历史数据（自动追加）
+      │    ├── 增量变化.md        ← 新增/已解决 Issue 对比
       │    └── projects/          ← 各项目独立报告
       │
       └──► snapshots/YYYY-MM-DD/ ← 历史快照归档
@@ -36,14 +37,18 @@ cd sonarcloud-report-skill/Script
 go build -o sonar-report main.go
 go build -o sonar-analyze analyze.go
 
-# 列出组织下所有项目
-./sonar-report -org your-org -list
+# 方式 1: 配置文件（推荐）
+cp ppmp.json ~/.ppmp.json   # 编辑 org 和 output
+./sonar-analyze              # 零参数运行
+
+# 方式 2: CLI 参数
+./sonar-analyze -org your-org -o "/path/to/obsidian/PPMP"
 
 # 单项目报告
 ./sonar-report -project your-org_your-project -o report.md
 
-# 批量分析 → Obsidian
-./sonar-analyze -org your-org -o "/path/to/your/obsidian/vault/PPMP"
+# 列出组织下所有项目
+./sonar-report -org your-org -list
 ```
 
 ## 输出说明
@@ -53,9 +58,50 @@ go build -o sonar-analyze analyze.go
 | `项目质量总览.md` | 健康度排名 + 质量门 + 指标汇总 | 项目质量概览 |
 | `问题归类统计.md` | 按规则聚合 Top 30 + 示例 | 了解问题分布 |
 | `高频问题清单.md` | 跨项目共性问题 + 编码检查清单 | **编码前必读** |
-| `质量待办.md` | BLOCKER/CRITICAL checkbox 清单 | 修复任务追踪 |
+| `质量待办.md` | BLOCKER/CRITICAL checkbox 清单（状态持久化） | 修复任务追踪 |
 | `质量趋势.md` | 历史数据（每次 analyze 追加） | 质量变化趋势 |
+| `增量变化.md` | 与上次运行对比（新增/已解决） | 发现退化 |
 | `projects/<key>.md` | 单项目详细报告 | 定位具体问题 |
+
+## 特性
+
+### 配置文件
+
+在 `./ppmp.json` 或 `~/.ppmp.json` 中保存常用参数，避免每次手打：
+
+```json
+{
+  "org": "your-org",
+  "output": "D:\\workspace\\MyMind\\PPMP",
+  "token": "",
+  "issues_limit": 500
+}
+```
+
+CLI 参数优先于配置文件。
+
+### 增量对比
+
+每次运行自动与上次对比，输出 `增量变化.md`：
+- 📈 新增 Issue（引入了新问题）
+- 📉 已解决 Issue（修复了旧问题）
+- 净变化趋势
+
+### 待办状态持久化
+
+`质量待办.md` 中手动勾选的 `[x]` 会在下次运行时保留，不会被覆盖。
+
+### 健康度评分
+
+0-100 分算法：`100 - (BLOCKER×10 + CRITICAL×5 + MAJOR×2 + MINOR×1)`
+
+| 分段 | 含义 |
+|------|------|
+| 🟢 80-100 | 健康 |
+| 🟡 60-79 | 需关注 |
+| 🟠 40-59 | 需改进 |
+| 🔴 0-39 | 严重 |
+| ⚪ - | 未分析 |
 
 ## Agent 集成
 
@@ -95,8 +141,8 @@ Agent 在为某项目编写代码时，应先读取：
 ### sonar-analyze
 
 ```
--org <key>           Organization key（必填）
--o <dir>             输出目录（必填）
+-org <key>           Organization key（必填，或在 ppmp.json 中配置）
+-o <dir>             输出目录（必填，或在 ppmp.json 中配置）
 -token <token>       SonarCloud Token
 -issues-limit <n>    每项目 Issue 上限（默认 500）
 ```
@@ -111,7 +157,8 @@ Agent 在为某项目编写代码时，应先读取：
 PPMP/
 ├── README.md
 ├── .gitignore
-├── samples/                            # 示例输出
+├── ppmp.json                          # 配置文件模板
+├── samples/                           # 示例输出
 │   ├── 项目质量总览.md
 │   ├── 高频问题清单.md
 │   ├── 质量待办.md
@@ -119,9 +166,9 @@ PPMP/
 │   └── projects/
 │       └── your-org_my-project-a.md
 └── sonarcloud-report-skill/
-    ├── SKILL.md                        # Agent Skill 文档
+    ├── SKILL.md                       # Agent Skill 文档
     └── Script/
         ├── go.mod
-        ├── main.go                     # sonar-report 源码
-        └── analyze.go                  # sonar-analyze 源码
+        ├── main.go                    # sonar-report 源码
+        └── analyze.go                 # sonar-analyze 源码
 ```
